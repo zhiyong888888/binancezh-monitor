@@ -91,6 +91,8 @@ STATE_FILE = os.getenv("STATE_FILE", str(BASE_DIR / ".last_seen.json"))
 LOG_FILE = os.getenv("LOG_FILE", str(BASE_DIR / "monitor.log"))
 MAX_FAILS_BEFORE_ALERT = int(os.getenv("MAX_FAILS_BEFORE_ALERT", "5"))
 SEEN_KEEP = int(os.getenv("SEEN_KEEP", "500"))
+# 单轮最多推送条数（防御：即使去重异常也不会刷屏 / 触发 Server酱 限流）
+MAX_PUSH_PER_RUN = int(os.getenv("MAX_PUSH_PER_RUN", "10"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 USER_AGENT = os.getenv(
     "USER_AGENT",
@@ -555,24 +557,36 @@ def build_alert(fails, ex):
 # 核心逻辑
 # ---------------------------------------------------------------------------
 def run_once(state):
-    """抓取一次源，推送新条目。返回本轮推送条数。"""
+    """抓取一次源，推送新条目。返回本轮推送条数。
+
+    去重以「历史见过的最大雪花 ID（max_id）」为准：只推送 ID 严格大于 max_id 的推文。
+    雪花 ID 随时间单调递增，故「比 max_id 大」⇔「比我们见过的最新推文更新」。
+    任何历史老推文（即便被 jina 兜底误抓回来）都不可能被当新推文推送。
+    """
     entries = fetch_source()
     if not entries:
         raise RuntimeError("源为空（账号可能无新内容，或监控源异常）")
 
+    max_id = int(str(state.get("max_id", "0") or "0"))
     seen = set(state.get("seen", []))
-    new = [e for e in entries if e.get("id") and e.get("id") not in seen]
 
-    # 首次运行：只记录历史，不推送（避免一上来轰炸历史推文）
-    if state.get("first_run"):
-        state["seen"] = [e["id"] for e in entries[:SEEN_KEEP] if e.get("id")]
+    # 首次运行 / 缺失基线：只记录历史最新 ID，不推送（避免轰炸历史推文或误推老推文）
+    if state.get("first_run") or max_id == 0:
+        if entries:
+            max_id = max(int(e["id"]) for e in entries if e.get("id"))
+        state["max_id"] = str(max_id)
+        state["seen"] = [e["id"] for e in entries[-SEEN_KEEP:] if e.get("id")]  # 保留最新若干条
         state["first_run"] = False
-        log.info("首次运行，已记录 %d 条历史，不推送", len(state["seen"]))
+        log.info("基线初始化，记录最新推文 ID=%s，本轮不推送", max_id)
         return 0
+
+    # 只认「比历史最新 ID 更大（时间更新）」的推文；历史老推文一律忽略
+    candidates = [e for e in entries if e.get("id") and int(e["id"]) > max_id]
+    candidates.sort(key=lambda e: int(e["id"]))  # 旧→新
 
     # 关键词过滤
     notify = []
-    for e in new:
+    for e in candidates:
         if KEYWORD_FILTER:
             blob = ((e.get("title") or "") + " " + (e.get("link") or "")).lower()
             if not any(k.lower() in blob for k in KEYWORD_FILTER):
@@ -580,13 +594,22 @@ def run_once(state):
                 continue
         notify.append(e)
 
+    # 安全上限：单轮最多推送 MAX_PUSH_PER_RUN 条，避免异常时刷屏 / 触发 Server酱 限流
+    notify = notify[:MAX_PUSH_PER_RUN]
+
     # 旧的先推，新的后推（与发布时间顺序一致）
     ok = notify_entries(list(reversed(notify)))
-    for e in notify[:ok]:
+    pushed = notify[:ok]
+    for e in pushed:
         seen.add(e["id"])
+    if pushed:
+        new_max = max(int(e["id"]) for e in pushed)
+        if new_max > max_id:
+            max_id = new_max
     if ok < len(notify):
         log.warning("推送中断（成功 %d/%d），剩余下次重试", ok, len(notify))
 
+    state["max_id"] = str(max_id)
     state["seen"] = list(seen)[-SEEN_KEEP:]
     return ok
 
