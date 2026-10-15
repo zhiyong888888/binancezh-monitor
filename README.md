@@ -69,6 +69,7 @@ auth_token=xxxx; ct0=yyyy; twid=u%3Azzz
 | `TW_COOKIE` | 空 | X 登录 cookie（仅 twscrape 源需要） |
 | `TW_LIMIT` | `20` | 每次轮询取多少条 |
 | `RSS_URL` | `http://localhost:1200/twitter/user/binancezh` | 仅 `SOURCE_MODE=rss` 时用 |
+| `FETCH_PROXY_URL` | 空 | 抓取代理地址（强烈推荐用于 GitHub Actions）。GitHub 的云 IP 会被 Twitter 限流(429)，设此值后抓取改走该代理（典型是 Cloudflare Worker，免费无需信用卡）。见 `CloudflareWorker部署.md` |
 | `POLL_INTERVAL` | `300` | 轮询间隔（秒），建议 ≥120 |
 | `KEYWORD_FILTER` | 空 | 关键词过滤，逗号分隔；空=全部 |
 | `MAX_FAILS_BEFORE_ALERT` | `5` | 连续失败几次后发微信告警 |
@@ -83,7 +84,7 @@ auth_token=xxxx; ct0=yyyy; twid=u%3Azzz
 | 现象 | 处理 |
 |------|------|
 | 微信收不到 | 检查 `SERVERCHAN_KEY` 是否填对、是否取消关注/屏蔽了「方糖」服务号；先跑 `--test-push` 确认能收到 |
-| 抓不到推文 / Actions 里报错 | 看 Actions 日志；syndication 偶发 429 会自动重试 3 次；连续 5 次失败会往微信推「⚠️ 监控源异常」 |
+| 抓不到推文 / Actions 里报错 `syndication 429 限流` | **正常现象**：GitHub 云 IP 被 Twitter 限流。代码已内置兜底链（直连 → `FETCH_PROXY_URL` 代理 → jina 兜底）。最稳解：按 `CloudflareWorker部署.md` 部署一个 Worker 并填 `FETCH_PROXY_URL` Secret |
 | 想立刻验证真实推送 | 见部署指南「想立刻验证真实推文推送」一节（删掉最新一条 ID 再跑） |
 | 首跑不推送 | 正常：首次只记录历史，等下一条新推文才触发 |
 | 想只收特定内容 | `KEYWORD_FILTER=上线,公告,维护`（逗号分隔） |
@@ -99,5 +100,7 @@ binancezh-monitor/
 ├── requirements.txt           # Python 依赖（requests / feedparser / python-dotenv）
 ├── .github/workflows/monitor.yml  # GitHub Actions 工作流（每 5 分钟）
 ├── GitHubActions部署指南.md    # 6 步部署教程
+├── CloudflareWorker部署.md     # 可选：Cloudflare Worker 代理（解决 GitHub 429 限流）
+├── worker.js                   # Cloudflare Worker 源码（部署到 CF 即得到 FETCH_PROXY_URL）
 └── README.md
 ```

@@ -45,10 +45,11 @@ jobs:
       - name: 执行监控检查
         if: inputs.mode != 'test-push'
         env:
-          SOURCE_MODE: syndication          # Twitter 官方 widget 接口，免登录
+          SOURCE_MODE: syndication          # 韧性链：直连 → 代理(FETCH_PROXY_URL) → jina 兜底
           TW_SCREEN_NAME: binancezh
           PUSH_MODE: serverchan
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          FETCH_PROXY_URL: ${{ secrets.FETCH_PROXY_URL }}   # 可选：Cloudflare Worker 等代理地址
           STATE_FILE: .last_seen.json
         run: python monitor.py --once
 

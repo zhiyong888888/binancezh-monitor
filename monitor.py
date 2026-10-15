@@ -64,6 +64,14 @@ if TWS_PROXY:
     # twscrape 通过环境变量 TWS_PROXY 把请求走代理，需在 import twscrape 前设好
     os.environ["TWS_PROXY"] = TWS_PROXY.strip()
 
+# 抓取代理 URL（可选，强烈推荐用于 GitHub Actions）。
+# 用途：GitHub 的云 IP 会被 Twitter 限流（429），因此让抓取请求改走一个
+# 运行在「不受限 IP」上的代理（典型是 Cloudflare Worker，免费、无需信用卡），
+# 由它去抓 Twitter 再把原始 HTML 回传。
+# 例如：https://binancezh-fetch.<你的子域>.workers.dev
+# 不填则直接抓（在你本机/有代理的环境可用，GitHub 上会 429）。
+FETCH_PROXY_URL = os.getenv("FETCH_PROXY_URL", "").strip()
+
 PUSH_MODE = os.getenv("PUSH_MODE", "serverchan")    # serverchan | pushplus | wxpusher | wecom_webhook | wecom_app
 SERVERCHAN_KEY = os.getenv("SERVERCHAN_KEY", "")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN", "")
@@ -159,18 +167,60 @@ def _collect_tweet_objects(obj, depth=0):
     return out
 
 
-def fetch_syndication():
+def _parse_syndication_html(html):
+    """从 syndication 返回的 HTML 里提取 @TW_SCREEN_NAME 的推文 entry 列表（旧→新）。"""
+    m = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html, re.S,
+    )
+    if not m:
+        raise RuntimeError("页面无 __NEXT_DATA__（接口结构可能已变）")
+    data = json.loads(m.group(1))
+    own, seen = [], set()
+    for t in _collect_tweet_objects(data):
+        tid = str(t.get("id_str") or "")
+        user = (t.get("user") or {}).get("screen_name", "") or ""
+        if not tid or tid in seen:
+            continue
+        if user.lower() != TW_SCREEN_NAME.lower():
+            continue  # 过滤引用推/转发里夹杂的他人推文
+        seen.add(tid)
+        own.append(t)
+    if not own:
+        raise RuntimeError("未解析到任何推文（可能被限流或结构变更）")
+    entries = []
+    for t in own:
+        tid = str(t["id_str"])
+        entries.append({
+            "id": tid,
+            "title": t.get("full_text") or "",
+            "link": f"https://x.com/{TW_SCREEN_NAME}/status/{tid}",
+            "published": t.get("created_at") or "",
+        })
+    # 推文 ID 为雪花 ID，随时间单调递增，按 ID 排序即时间序（旧→新）
+    entries.sort(key=lambda e: int(e["id"]))
+    return entries
+
+
+def fetch_syndication(proxy_url=None):
     """Twitter 官方 widget syndication 接口抓 @TW_SCREEN_NAME 最近推文（免登录、免 cookie）。
-    家云在墙内该域名被 GFW 封，此模式适用于 GitHub Actions 等墙外环境。
+    - proxy_url 为空：直接抓（本机/有代理环境可用；GitHub 云 IP 会被 429 限流）
+    - proxy_url 非空：改抓该代理（典型是 Cloudflare Worker，跑在不受限 IP 上替我们抓 X）
     返回按时间排序（旧→新）的 entry 列表；内置 429 限流重试。
     """
-    url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{TW_SCREEN_NAME}"
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://platform.twitter.com/",
-    }
-    params = {"dnt": "true", "embedId": "twitter-widget-0"}
+    if proxy_url:
+        url = proxy_url
+        params = None
+        headers = {"User-Agent": USER_AGENT}
+        log.info("经代理 %s 抓取 syndication", proxy_url)
+    else:
+        url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{TW_SCREEN_NAME}"
+        params = {"dnt": "true", "embedId": "twitter-widget-0"}
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://platform.twitter.com/",
+        }
     last_err = None
     for attempt in range(3):
         try:
@@ -178,36 +228,7 @@ def fetch_syndication():
             if resp.status_code == 429:
                 raise RuntimeError("syndication 429 限流")
             resp.raise_for_status()
-            m = re.search(
-                r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-                resp.text, re.S,
-            )
-            if not m:
-                raise RuntimeError("页面无 __NEXT_DATA__（接口结构可能已变）")
-            data = json.loads(m.group(1))
-            own, seen = [], set()
-            for t in _collect_tweet_objects(data):
-                tid = str(t.get("id_str") or "")
-                user = (t.get("user") or {}).get("screen_name", "") or ""
-                if not tid or tid in seen:
-                    continue
-                if user.lower() != TW_SCREEN_NAME.lower():
-                    continue  # 过滤引用推/转发里夹杂的他人推文
-                seen.add(tid)
-                own.append(t)
-            if not own:
-                raise RuntimeError("未解析到任何推文（可能被限流或结构变更）")
-            entries = []
-            for t in own:
-                tid = str(t["id_str"])
-                entries.append({
-                    "id": tid,
-                    "title": t.get("full_text") or "",
-                    "link": f"https://x.com/{TW_SCREEN_NAME}/status/{tid}",
-                    "published": t.get("created_at") or "",
-                })
-            # 推文 ID 为雪花 ID，随时间单调递增，按 ID 排序即时间序（旧→新）
-            entries.sort(key=lambda e: int(e["id"]))
+            entries = _parse_syndication_html(resp.text)
             log.info("syndication 抓到 %d 条推文", len(entries))
             return entries
         except Exception as e:
@@ -216,6 +237,67 @@ def fetch_syndication():
             if attempt < 2:
                 time.sleep(3 * (attempt + 1))
     raise RuntimeError(f"syndication 抓取失败: {last_err}")
+
+
+def fetch_via_jina():
+    """兜底：经 r.jina.ai 阅读器代理抓 x.com 个人主页（其服务器代抓，绕开 GitHub 的 429）。
+    返回 markdown，从中提取推文 ID + 链接 + 附近文本。文本精度不如 syndication JSON，
+    作为 syndication / 代理都失败时的最后手段；至少能拿到 ID 与链接触发通知。
+    """
+    url = f"https://r.jina.ai/https://x.com/{TW_SCREEN_NAME}"
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            md = resp.text
+            ids = re.findall(rf"x\.com/{re.escape(TW_SCREEN_NAME)}/status/(\d+)", md)
+            if not ids:
+                raise RuntimeError("jina 未返回任何推文链接")
+            seen, entries = set(), []
+            for tid in sorted(set(ids), key=lambda x: int(x)):
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                # 取该推文链接附近的纯文本作为近似正文
+                idx = md.find(f"status/{tid}")
+                seg = md[max(0, idx - 600):idx + 50]
+                seg = re.sub(r"!\[.*?\]\(.*?\)", "", seg)        # 去图片
+                seg = re.sub(r"\[([^\]]+)\]\(.*?\)", r"\1", seg)  # 去链接标记
+                lines = [l.strip() for l in seg.splitlines() if l.strip()]
+                text = lines[-3:] and "\n".join(lines[-3:]) or ""
+                text = (text or "（点开查看原文）")[:800]
+                entries.append({
+                    "id": tid,
+                    "title": text,
+                    "link": f"https://x.com/{TW_SCREEN_NAME}/status/{tid}",
+                    "published": "",
+                })
+            log.info("jina 抓到 %d 条推文（近似文本）", len(entries))
+            return entries
+        except Exception as e:
+            last_err = e
+            log.warning("jina 第 %d 次尝试失败: %s", attempt + 1, e)
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"jina 抓取失败: {last_err}")
+
+
+def fetch_syndication_auto():
+    """韧性链：直接抓 → (若配了)代理抓 → jina 兜底。任一成功即返回。"""
+    try:
+        return fetch_syndication()
+    except Exception as e:
+        log.warning("syndication 直连失败: %s", e)
+    if FETCH_PROXY_URL:
+        try:
+            return fetch_syndication(proxy_url=FETCH_PROXY_URL)
+        except Exception as e:
+            log.warning("经代理抓取失败: %s", e)
+    try:
+        return fetch_via_jina()
+    except Exception as e:
+        raise RuntimeError(f"所有抓取方式均失败: {e}")
 
 
 def fetch_twscrape():
@@ -260,13 +342,13 @@ def fetch_twscrape():
 def fetch_source():
     """按 SOURCE_MODE 抓取，返回 entry 列表（dict: id/title/link/published）。"""
     if SOURCE_MODE == "syndication":
-        return fetch_syndication()
+        return fetch_syndication_auto()
     if SOURCE_MODE == "auto":
-        # 自动链：syndication（免登录，墙外稳定）→ twscrape（需 cookie）→ rss
+        # 自动链：syndication（免登录）→ 代理（若配）→ jina 兜底 → twscrape（需 cookie）→ rss
         try:
-            return fetch_syndication()
+            return fetch_syndication_auto()
         except Exception as e:
-            log.warning("syndication 失败，降级: %s", e)
+            log.warning("syndication 全链失败，降级: %s", e)
             if TW_COOKIE:
                 try:
                     return fetch_twscrape()
