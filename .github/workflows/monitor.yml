@@ -1,0 +1,65 @@
+name: binancezh-monitor
+
+# 每 5 分钟检查一次 @binancezh 新推文，推到 Server酱 → 个人微信
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # UTC 时间；GitHub cron 可能延迟几分钟，属正常
+  workflow_dispatch:        # 手动触发（测试用）
+    inputs:
+      mode:
+        description: "check=检查新推文并推送  test-push=只发一条测试推送"
+        type: choice
+        options:
+          - check
+          - test-push
+        default: check
+
+permissions:
+  contents: write   # 允许把去重状态提交回仓库
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      # ---------- 手动测试推送 ----------
+      - name: 测试推送
+        if: inputs.mode == 'test-push'
+        env:
+          PUSH_MODE: serverchan
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+        run: python monitor.py --test-push
+
+      # ---------- 正常监控 ----------
+      - name: 执行监控检查
+        if: inputs.mode != 'test-push'
+        env:
+          SOURCE_MODE: syndication          # Twitter 官方 widget 接口，免登录
+          TW_SCREEN_NAME: binancezh
+          PUSH_MODE: serverchan
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          STATE_FILE: .last_seen.json
+        run: python monitor.py --once
+
+      # ---------- 保存去重状态（每次运行都提交，保持仓库活跃，防止 schedule 被停用） ----------
+      - name: 保存状态到仓库
+        if: inputs.mode != 'test-push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .last_seen.json || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: 更新监控状态 $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git push
+          fi

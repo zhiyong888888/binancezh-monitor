@@ -1,0 +1,17 @@
+# 本地敏感配置与运行时产物——绝不进仓库
+config.env
+accounts.db
+monitor.log
+.last_seen.json.tmp
+__pycache__/
+*.pyc
+*.tmp
+
+# 本地诊断/测试残留
+syn_test.html
+diag*.py
+
+# 本地部署辅助（Oracle 密钥等）
+.deployenv/
+oracle_key
+oracle_key.pub
