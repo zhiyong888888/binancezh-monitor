@@ -225,7 +225,7 @@ def fetch_syndication(proxy_url=None):
             "Referer": "https://platform.twitter.com/",
         }
     last_err = None
-    for attempt in range(5):
+    for attempt in range(2):
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
             if resp.status_code == 429:
@@ -243,6 +243,35 @@ def fetch_syndication(proxy_url=None):
     raise RuntimeError(f"syndication 抓取失败: {last_err}")
 
 
+def fetch_jina_syndication():
+    """云端首选：让 r.jina.ai 以 html 模式抓取 syndication 接口本身。
+
+    为什么不直接抓 x.com 主页：X 已把主页推文链接 blob 化，拿不到 tweet ID。
+    而 syndication 接口返回的 HTML 里推文 ID 藏在 __NEXT_DATA__ JSON 中——jina 用
+    x-return-format: html 原样回传整段 HTML，__NEXT_DATA__ 完整保留，可解析出全部推文 ID。
+    这条对 GitHub 云 IP 同样有效（jina 的出口 IP 未被 X 限流），是替代 Cloudflare Worker 的稳链路。
+    """
+    target = (
+        f"https://r.jina.ai/https://syndication.twitter.com/srv/timeline-profile/"
+        f"screen-name/{TW_SCREEN_NAME}?dnt=true"
+    )
+    headers = {"User-Agent": USER_AGENT, "x-return-format": "html"}
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(target, headers=headers, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            entries = _parse_syndication_html(resp.text)
+            log.info("经 jina(html) 抓到 %d 条推文", len(entries))
+            return entries
+        except Exception as e:
+            last_err = e
+            log.warning("jina-syndication 第 %d 次尝试失败: %s", attempt + 1, e)
+            if attempt < 2:
+                time.sleep(2 + attempt * 2 + random.uniform(0, 2))
+    raise RuntimeError(f"jina-syndication 抓取失败: {last_err}")
+
+
 def fetch_via_jina():
     """兜底：经 r.jina.ai 阅读器代理抓 x.com 个人主页（其服务器代抓，绕开 GitHub 的 429）。
     返回 markdown，从中提取推文 ID + 链接 + 附近文本。文本精度不如 syndication JSON，
@@ -250,7 +279,7 @@ def fetch_via_jina():
     """
     url = f"https://r.jina.ai/https://x.com/{TW_SCREEN_NAME}"
     last_err = None
-    for attempt in range(5):
+    for attempt in range(3):
         try:
             resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
             resp.raise_for_status()
@@ -291,7 +320,18 @@ def fetch_via_jina():
 
 
 def fetch_syndication_auto():
-    """韧性链：直接抓 → (若配了)代理抓 → jina 兜底。任一成功即返回。"""
+    """韧性链（云端优先）：
+
+    1) jina(html) 抓 syndication 接口 —— GitHub 云 IP 必被 X 直连 429，但 jina 出口未被限流，
+       且 html 模式完整保留 __NEXT_DATA__，可解析全部推文 ID（高保真，首选）
+    2) 直连 syndication —— 本机/有代理环境可用，GitHub 上几乎必 429
+    3) (若配了) Cloudflare Worker 代理 —— 实测 CF IP 也常被 X 限流，作补充
+    4) jina 抓 x.com 主页 —— 链接被 blob 化，仅能兜底拿少量 ID（最后手段）
+    """
+    try:
+        return fetch_jina_syndication()
+    except Exception as e:
+        log.warning("jina-syndication(html) 失败，降级: %s", e)
     try:
         return fetch_syndication()
     except Exception as e:
