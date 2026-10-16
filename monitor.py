@@ -250,10 +250,17 @@ def fetch_jina_syndication():
     而 syndication 接口返回的 HTML 里推文 ID 藏在 __NEXT_DATA__ JSON 中——jina 用
     x-return-format: html 原样回传整段 HTML，__NEXT_DATA__ 完整保留，可解析出全部推文 ID。
     这条对 GitHub 云 IP 同样有效（jina 的出口 IP 未被 X 限流），是替代 Cloudflare Worker 的稳链路。
+
+    缓存击穿（本项目核心漏推根因的修复）：jina 按完整 URL 做缓存。若每次都抓同一个 URL，
+    jina 会一直回吐二级缓存里的旧快照，导致最新推文迟迟不出现在结果里（甚至快照回退到更早的
+    时间线）。这里拼一个随时间变化的 _cb 参数 + 真实 widget 的 embedId，让 jina 每次都重新
+    去 X 拉一次 syndication，拿到最新快照。Twitter 的 syndication 接口会忽略未知 query 参数，
+    所以不影响内容，只用于绕过 jina 缓存。
     """
+    cb = int(time.time())
     target = (
         f"https://r.jina.ai/https://syndication.twitter.com/srv/timeline-profile/"
-        f"screen-name/{TW_SCREEN_NAME}?dnt=true"
+        f"screen-name/{TW_SCREEN_NAME}?dnt=true&embedId=twitter-widget-0&_cb={cb}"
     )
     headers = {"User-Agent": USER_AGENT, "x-return-format": "html"}
     last_err = None
@@ -625,8 +632,18 @@ def run_once(state):
         log.info("基线初始化，记录最新推文 ID=%s，本轮不推送", max_id)
         return 0
 
-    # 只认「比历史最新 ID 更大（时间更新）」的推文；历史老推文一律忽略
-    candidates = [e for e in entries if e.get("id") and int(e["id"]) > max_id]
+    # 源当前返回的最新 ID
+    src_max = max((int(e["id"]) for e in entries if e.get("id")), default=0)
+    # 源最新 ID 落后于已记录的 max_id（典型：jina/Twitter 缓存滞后或快照回退），
+    # 说明源暂时给不出比已见更新内容。把 max_id 回退到源的最新，
+    # 避免「max_id 卡在高位 → 源永远凑不够更新推文 → 永久漏推」。
+    # 下方会把源返回的全部 ID 写入 seen，故回退 max_id 不会造成历史推文被重推。
+    if src_max and src_max < max_id:
+        log.warning("源最新ID(%s)落后于记录max_id(%s)，回退max_id解除漏推卡死", src_max, max_id)
+        max_id = src_max
+
+    # 候选：严格比 max_id 新，且未在 seen 中出现过（双保险去重，防回退后重推历史）
+    candidates = [e for e in entries if e.get("id") and int(e["id"]) > max_id and e["id"] not in seen]
     candidates.sort(key=lambda e: int(e["id"]))  # 旧→新
 
     # 关键词过滤
@@ -653,6 +670,15 @@ def run_once(state):
             max_id = new_max
     if ok < len(notify):
         log.warning("推送中断（成功 %d/%d），剩余下次重试", ok, len(notify))
+        state["push_fails"] = int(state.get("push_fails", 0) or 0) + 1
+    else:
+        state["push_fails"] = 0
+        state["alerted_push"] = False
+
+    # 把本轮抓取到的全部 ID 记入 seen（防止后续 max_id 回退时重推历史）
+    for e in entries:
+        if e.get("id"):
+            seen.add(e["id"])
 
     state["max_id"] = str(max_id)
     state["seen"] = list(seen)[-SEEN_KEEP:]
@@ -683,6 +709,17 @@ def main():
             n = run_once(state)
             state["fails"] = 0
             state["alerted_outage"] = False
+            # 推送端持续失败告警（如 Server酱 免费额度耗尽 / 密钥失效）：
+            # 抓取正常但微信收不到时，至少让用户知道推送通道挂了，而不是一片绿却没消息。
+            if state.get("push_fails", 0) >= MAX_FAILS_BEFORE_ALERT and not state.get("alerted_push"):
+                try:
+                    notify_entries([{"id": "_push_alert", "title":
+                        f"⚠️ 推送端异常\n连续 {state['push_fails']} 次推送失败"
+                        "（可能 Server酱 免费额度耗尽或密钥失效），请检查推送配置",
+                        "link": "", "published": ""}])
+                except Exception:
+                    pass
+                state["alerted_push"] = True
             state["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S %z")
             save_state(state)
             log.info("单次运行完成，本轮推送 %d 条", n)
