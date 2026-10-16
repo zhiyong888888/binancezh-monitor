@@ -104,3 +104,26 @@ binancezh-monitor/
 ├── worker.js                   # Cloudflare Worker 源码（部署到 CF 即得到 FETCH_PROXY_URL）
 └── README.md
 ```
+
+---
+
+## 七、运维笔记：GitHub cron 调度会"假活停摆"（重点）
+
+**现象**：Actions 页面里 workflow 显示 `active / disabled_reason: None`，但**定时运行数卡住不动**（如 TOTAL 停在 9，最后一条 `schedule` 运行停在某个时间点，之后几小时零定时触发）。此时 @binancezh 发了新推文也不会被抓取，微信自然收不到——**不是监控逻辑 bug，是 GitHub 内部 cron 调度器的问题**。
+
+**根因**：GitHub Actions 的 `schedule` 事件属于 **best-effort、无 SLA**，在负载高时会被 GitHub 静默丢弃/延迟（这是官方明示的行为，不是我们代码的问题）。本仓库已实测 **1 天内停摆 3 次**，每次停数小时。
+
+**快速恢复（已验证有效）**：往 `main` 推任意一次提交，调度通常会在几分钟内恢复；下一次 `schedule` 运行会用 `max_id` 去重逻辑**自动补推**停摆期间的新推文（不会漏、不会重复）。
+
+**根治（三选一，建议尽快做）**：
+
+| 方案 | 原理 | 额外要求 |
+|------|------|----------|
+| **A. 外部 cron → workflow_dispatch**（推荐，改动最小） | 用 cron-job.org（免费、免信用卡）每 5 分钟 `POST` 触发 GitHub 的 `workflow_dispatch` API。dispatch 触发是可靠的，绕开 GitHub 自家不可靠的 cron | PAT 需加 **`Actions: Read and write`** 权限（当前 PAT 仅 Contents，dispatch 会 403） |
+| **B. Cloudflare Worker Cron Trigger** | 把整套监控搬进 CF Worker，用 CF Cron（稳定、免费）定时跑，彻底脱离 GitHub | 需 CF 账号；`worker.js` 已就绪，扩展为完整监控即可 |
+| **C. 本机 Windows 任务计划** | 在你常开的 Windows 上建"任务计划程序"，每 5 分钟跑 `python monitor.py --once`（SOURCE_MODE=syndication） | 零外部依赖；仅当 PC 关机/睡眠时暂停 |
+
+> 当前推荐 **A**：保留 GitHub 的免费算力与 Secrets，只把"触发器"换成可靠的外部服务。配置 cron-job.org 时填：
+> `POST https://api.github.com/repos/zhiyong888888/binancezh-monitor/actions/workflows/monitor.yml/dispatches`
+> Header：`Authorization: Bearer <你的PAT>`、`Content-Type: application/json`、`Accept: application/vnd.github+json`
+> Body：`{"ref":"main","inputs":{"mode":"check"}}`，Cron 设 `*/5 * * * *`。
