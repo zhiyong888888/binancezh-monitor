@@ -5,9 +5,22 @@
 //
 // 部署后把 Worker 地址（形如 https://binancezh-fetch.<子域>.workers.dev ）填到
 // GitHub 仓库 Secrets 的 FETCH_PROXY_URL 即可。
+//
+// 可选鉴权：在 Worker 设置 → Variables → 添加环境变量 SECRET（任意随机串），
+// 则调用方需以 https://<worker>/?token=<SECRET> 访问，避免被公开滥用导致 X 限流。
+// 不设 SECRET 则公开（仅抓取公开数据，风险可控）。
 
 export default {
   async fetch(request, env, ctx) {
+    // —— 可选鉴权 ——
+    const SECRET = env.SECRET || "";
+    if (SECRET) {
+      const url = new URL(request.url);
+      if (url.searchParams.get("token") !== SECRET) {
+        return new Response("forbidden", { status: 403 });
+      }
+    }
+
     const target =
       "https://syndication.twitter.com/srv/timeline-profile/screen-name/binancezh" +
       "?dnt=true&embedId=twitter-widget-0";
@@ -20,16 +33,30 @@ export default {
       "Referer": "https://platform.twitter.com/",
     };
 
-    const resp = await fetch(target, { headers });
-    const text = await resp.text();
-
-    return new Response(text, {
-      status: resp.status,
-      headers: {
-        "Content-Type": "text/html; charset=utf-8",
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "no-store",
-      },
+    // 上游偶发抖动时重试，提升稳定性
+    let lastErr = null;
+    for (let i = 0; i < 3; i++) {
+      try {
+        const resp = await fetch(target, { headers });
+        const text = await resp.text();
+        if (resp.status === 429) {
+          throw new Error("upstream 429");
+        }
+        return new Response(text, {
+          status: resp.status,
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store",
+          },
+        });
+      } catch (e) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 1500 * (i + 1)));
+      }
+    }
+    return new Response("upstream fetch failed: " + String(lastErr), {
+      status: 502,
     });
   },
 };

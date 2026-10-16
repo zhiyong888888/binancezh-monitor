@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import time
+import random
 import json
 import asyncio
 import logging
@@ -93,7 +94,7 @@ MAX_FAILS_BEFORE_ALERT = int(os.getenv("MAX_FAILS_BEFORE_ALERT", "5"))
 SEEN_KEEP = int(os.getenv("SEEN_KEEP", "500"))
 # 单轮最多推送条数（防御：即使去重异常也不会刷屏 / 触发 Server酱 限流）
 MAX_PUSH_PER_RUN = int(os.getenv("MAX_PUSH_PER_RUN", "10"))
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -224,7 +225,7 @@ def fetch_syndication(proxy_url=None):
             "Referer": "https://platform.twitter.com/",
         }
     last_err = None
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
             if resp.status_code == 429:
@@ -236,8 +237,9 @@ def fetch_syndication(proxy_url=None):
         except Exception as e:
             last_err = e
             log.warning("syndication 第 %d 次尝试失败: %s", attempt + 1, e)
-            if attempt < 2:
-                time.sleep(3 * (attempt + 1))
+            if attempt < 4:
+                # 随机退避 2~7s，打散请求避免被 429
+                time.sleep(2 + attempt * 1.5 + random.uniform(0, 3))
     raise RuntimeError(f"syndication 抓取失败: {last_err}")
 
 
@@ -248,12 +250,16 @@ def fetch_via_jina():
     """
     url = f"https://r.jina.ai/https://x.com/{TW_SCREEN_NAME}"
     last_err = None
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
             resp.raise_for_status()
             md = resp.text
+            # 优先匹配普通 status 链接；X 反爬会把部分链接 blob 化导致拿不到 ID，
+            # 此时再退一步用「19 位雪花 ID」兜底（推文 ID 多为 19 位纯数字）
             ids = re.findall(rf"x\.com/{re.escape(TW_SCREEN_NAME)}/status/(\d+)", md)
+            if not ids:
+                ids = re.findall(r"(?<!\d)(\d{18,19})(?!\d)", md)
             if not ids:
                 raise RuntimeError("jina 未返回任何推文链接")
             seen, entries = set(), []
@@ -261,8 +267,7 @@ def fetch_via_jina():
                 if tid in seen:
                     continue
                 seen.add(tid)
-                # 取该推文链接附近的纯文本作为近似正文
-                idx = md.find(f"status/{tid}")
+                idx = md.find(tid)
                 seg = md[max(0, idx - 600):idx + 50]
                 seg = re.sub(r"!\[.*?\]\(.*?\)", "", seg)        # 去图片
                 seg = re.sub(r"\[([^\]]+)\]\(.*?\)", r"\1", seg)  # 去链接标记
@@ -280,8 +285,8 @@ def fetch_via_jina():
         except Exception as e:
             last_err = e
             log.warning("jina 第 %d 次尝试失败: %s", attempt + 1, e)
-            if attempt < 2:
-                time.sleep(3 * (attempt + 1))
+            if attempt < 4:
+                time.sleep(2 + attempt * 1.5 + random.uniform(0, 3))
     raise RuntimeError(f"jina 抓取失败: {last_err}")
 
 
@@ -657,7 +662,9 @@ def main():
                 save_state(state)
             except Exception as ex3:
                 log.error("状态保存失败: %s", ex3)
-            sys.exit(1)
+            # 抓取失败本身不是程序 bug（多为 GitHub 云 IP 被 X 限流等外部因素），
+            # 用 exit 0 避免 GitHub Actions 满屏红 ✗；连续失败已达阈值时上面已推微信告警
+            sys.exit(0)
         sys.exit(0)
 
     # 常驻循环

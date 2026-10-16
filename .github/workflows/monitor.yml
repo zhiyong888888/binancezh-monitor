@@ -64,6 +64,9 @@ jobs:
           PUSH_MODE: serverchan
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           STATE_FILE: .last_seen.json
+          # 抓取代理解（Cloudflare Worker，跑在不受 X 限流的 IP 上）。
+          # 未配置该 Secret 时为空，自动回退「直连 syndication → jina 兜底」。
+          FETCH_PROXY_URL: ${{ secrets.FETCH_PROXY_URL }}
         run: python monitor.py --once
 
       # ---------- 保存去重状态 ----------
