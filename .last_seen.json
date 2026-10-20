@@ -130,9 +130,9 @@
   ],
   "first_run": false,
   "alerted_outage": false,
-  "fails": 1,
+  "fails": 2,
   "max_id": "2110706107740266812",
-  "last_run": "2026-10-20 16:05:57 +0000",
+  "last_run": "2026-10-20 16:11:01 +0000",
   "push_fails": 0,
   "alerted_push": false
 }
